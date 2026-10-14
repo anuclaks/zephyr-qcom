@@ -180,6 +180,52 @@ static struct net_if *get_iface(enum iface_type type, int argc, char *argv[])
 	return iface;
 }
 
+static int cmd_wifi_on(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct net_if *iface = net_if_get_wifi_sta();
+	int ret;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (iface == NULL) {
+		shell_error(sh, "No Wi-Fi STA interface found");
+		return -ENODEV;
+	}
+
+	ret = net_mgmt(NET_REQUEST_WIFI_ON, iface, NULL, 0U);
+	if (ret != 0) {
+		shell_error(sh, "Wi-Fi on failed: %d", ret);
+		return ret;
+	}
+
+	shell_print(sh, "Wi-Fi device is on");
+	return 0;
+}
+
+static int cmd_wifi_off(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct net_if *iface = net_if_get_wifi_sta();
+	int ret;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (iface == NULL) {
+		shell_error(sh, "No Wi-Fi STA interface found");
+		return -ENODEV;
+	}
+
+	ret = net_mgmt(NET_REQUEST_WIFI_OFF, iface, NULL, 0U);
+	if (ret != 0) {
+		shell_error(sh, "Wi-Fi off failed: %d", ret);
+		return ret;
+	}
+
+	shell_print(sh, "Wi-Fi device is off");
+	return 0;
+}
+
 static bool parse_number(const struct shell *sh, long *param, char *str,
 			 char *pname, long min, long max)
 {
@@ -5839,6 +5885,14 @@ SHELL_SUBCMD_ADD((wifi), dpp, &wifi_cmd_dpp,
 		 NULL,
 		 0, 0);
 #endif /* CONFIG_WIFI_NM_WPA_SUPPLICANT_DPP */
+
+SHELL_SUBCMD_ADD((wifi), on, NULL,
+		 SHELL_HELP("Initialize and power on the shared Wi-Fi device", NULL),
+		 cmd_wifi_on, 1, 1);
+
+SHELL_SUBCMD_ADD((wifi), off, NULL,
+		 SHELL_HELP("Deinitialize and power off the shared Wi-Fi device", NULL),
+		 cmd_wifi_off, 1, 1);
 
 #ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
 SHELL_STATIC_SUBCMD_SET_CREATE(

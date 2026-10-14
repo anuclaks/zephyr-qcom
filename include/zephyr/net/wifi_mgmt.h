@@ -153,6 +153,10 @@ enum net_request_wifi_cmd {
 	NET_REQUEST_WIFI_CMD_BGSCAN,
 	/** Wi-Fi Direct (P2P) operations*/
 	NET_REQUEST_WIFI_CMD_P2P_OPER,
+	/** Turn the shared Wi-Fi device on */
+	NET_REQUEST_WIFI_CMD_ON,
+	/** Turn the shared Wi-Fi device off */
+	NET_REQUEST_WIFI_CMD_OFF,
 	/** @cond INTERNAL_HIDDEN */
 	NET_REQUEST_WIFI_CMD_MAX
 	/** @endcond */
@@ -163,6 +167,18 @@ enum net_request_wifi_cmd {
 	(NET_WIFI_BASE | NET_REQUEST_WIFI_CMD_SCAN)
 
 NET_MGMT_DEFINE_REQUEST_HANDLER(NET_REQUEST_WIFI_SCAN);
+
+/** Turn the shared Wi-Fi device on */
+#define NET_REQUEST_WIFI_ON					\
+	(NET_WIFI_BASE | NET_REQUEST_WIFI_CMD_ON)
+
+NET_MGMT_DEFINE_REQUEST_HANDLER(NET_REQUEST_WIFI_ON);
+
+/** Turn the shared Wi-Fi device off */
+#define NET_REQUEST_WIFI_OFF					\
+	(NET_WIFI_BASE | NET_REQUEST_WIFI_CMD_OFF)
+
+NET_MGMT_DEFINE_REQUEST_HANDLER(NET_REQUEST_WIFI_OFF);
 
 /** Request a Wi-Fi connect */
 #define NET_REQUEST_WIFI_CONNECT				\
@@ -2014,6 +2030,23 @@ typedef void (*raw_scan_result_cb_t)(struct net_if *iface, int status,
 
 /** Wi-Fi management API */
 struct wifi_mgmt_ops {
+	/** Turn on the shared Wi-Fi device and firmware stack
+	 *
+	 * @param dev Pointer to the device structure for the driver instance.
+	 *
+	 * @return 0 if ok, < 0 if error
+	 */
+	int (*wifi_on)(const struct device *dev);
+	/** Turn off the shared Wi-Fi device and firmware stack
+	 *
+	 * The driver must reject this operation while a logical interface or
+	 * device transaction is active.
+	 *
+	 * @param dev Pointer to the device structure for the driver instance.
+	 *
+	 * @return 0 if ok, < 0 if error
+	 */
+	int (*wifi_off)(const struct device *dev);
 	/** Scan for Wi-Fi networks
 	 *
 	 * @param dev Pointer to the device structure for the driver instance.

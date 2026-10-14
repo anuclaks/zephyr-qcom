@@ -134,6 +134,15 @@ struct supplicant_context {
 	char if_name[CONFIG_NET_INTERFACE_NAME_LEN + 1];
 	struct k_fifo fifo;
 	int sock;
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
+	struct k_fifo nan_fifo;
+	struct k_mutex nan_lock;
+	struct k_sem nan_add_complete;
+	int nan_sock;
+	int nan_add_ret;
+	bool nan_add_pending;
+	bool nan_add_first_iface;
+#endif
 	struct k_work iface_work;
 	struct k_work_q iface_wq;
 	int (*iface_handler)(struct supplicant_context *ctx, struct net_if *iface);
@@ -365,7 +374,7 @@ static void zephyr_hostap_ctrl_iface_msg_cb(void *ctx, int level, enum wpa_msg_t
 static uint32_t get_iface_caps(struct net_if *iface)
 {
 	const struct device *dev = net_if_get_device(iface);
-	struct net_wifi_mgmt_offload *off_api;
+	struct wifi_nm_instance *nm = wifi_nm_get_instance("wifi_supplicant");
 	uint32_t caps = 0;
 
 	if (dev == NULL || dev->api == NULL) {
@@ -378,14 +387,15 @@ static uint32_t get_iface_caps(struct net_if *iface)
 		caps = off_api->wifi_mgmt_api->get_iface_caps(dev, iface);
 	}
 
-	return caps & BIT_MASK(WIFI_TYPE_MAX);
+	caps &= BIT_MASK(WIFI_TYPE_MAX);
+	return caps;
 }
 
 static int supplicant_register_iface_type(struct net_if *iface)
 {
 	const struct device *dev = net_if_get_device(iface);
 	struct wifi_nm_instance *nm = wifi_nm_get_instance("wifi_supplicant");
-	uint32_t caps = 0;
+	uint32_t caps;
 	int ret;
 
 	if (dev == NULL || nm == NULL) {
@@ -585,7 +595,8 @@ static int del_interface(struct supplicant_context *ctx, struct net_if *iface)
 		goto out;
 	}
 
-	ret = wifi_nm_unregister_mgd_iface(wifi_nm_get_instance("wifi_supplicant"), iface);
+	ret = wifi_nm_unregister_mgd_iface(
+		wifi_nm_get_instance("wifi_supplicant"), iface);
 	if (ret) {
 		LOG_ERR("Failed to unregister mgd iface %s with native stack (%d)",
 			ifname, ret);
@@ -607,6 +618,277 @@ free:
 out:
 	return ret;
 }
+
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
+/*
+ * wpa_supplicant interface state is owned by the HostAP/eloop thread.  NAN
+ * interface registration is therefore sent to that thread through a private
+ * FIFO and eventfd, just like other Zephyr-to-HostAP notifications.
+ */
+static void nan_add_handler(int sock, void *eloop_ctx, void *user_data)
+{
+	struct supplicant_context *ctx = user_data;
+	struct zephyr_msg *msg;
+	zvfs_eventfd_t value;
+
+	ARG_UNUSED(eloop_ctx);
+
+	do {
+		int result = -EINVAL;
+		bool first_iface = false;
+
+		(void)k_mutex_lock(&ctx->nan_lock, K_FOREVER);
+		if (zvfs_eventfd_read(sock, &value) < 0) {
+			if (ctx->nan_add_pending) {
+				ctx->nan_add_pending = false;
+				ctx->nan_add_ret = -errno;
+				k_sem_give(&ctx->nan_add_complete);
+			}
+			(void)k_mutex_unlock(&ctx->nan_lock);
+			return;
+		}
+
+		msg = k_fifo_get(&ctx->nan_fifo, K_NO_WAIT);
+		if (msg == NULL) {
+			if (ctx->nan_add_pending) {
+				ctx->nan_add_pending = false;
+				ctx->nan_add_ret = -EIO;
+				k_sem_give(&ctx->nan_add_complete);
+			}
+			(void)k_mutex_unlock(&ctx->nan_lock);
+			return;
+		}
+		(void)k_mutex_unlock(&ctx->nan_lock);
+
+		if (msg->data != NULL && msg->len == sizeof(struct net_if *)) {
+			struct net_if *iface;
+			struct wpa_interface wpa_iface = { 0 };
+			struct wpa_supplicant *wpa_s;
+			char ifname[IFNAMSIZ + 1] = { 0 };
+
+			memcpy(&iface, msg->data, sizeof(iface));
+			if (iface == NULL ||
+			    net_if_get_name(iface, ifname, sizeof(ifname) - 1) < 0) {
+				goto free_msg;
+			}
+
+			if (ctx->supplicant == NULL) {
+				result = -EIO;
+				goto free_msg;
+			}
+
+			if (wpa_supplicant_get_iface(ctx->supplicant, ifname) != NULL) {
+				result = -EALREADY;
+				goto free_msg;
+			}
+
+			wpa_iface.ifname = ifname;
+			wpa_iface.confname = "zephyr";
+			wpa_iface.driver = "zephyr";
+			wpa_iface.ctrl_interface = "zephyr";
+			wpa_iface.nan_mgmt = true;
+
+			wpa_s = wpa_supplicant_add_iface(ctx->supplicant,
+							 &wpa_iface, NULL);
+			if (wpa_s == NULL) {
+				result = -EIO;
+				LOG_ERR("Failed to add NAN interface %s", ifname);
+				goto free_msg;
+			}
+
+			/* Keep all HostAP/eloop registrations in this thread too. */
+			if (zephyr_wpa_ctrl_init(wpa_s) != 0) {
+				result = -EIO;
+				LOG_ERR("Failed to initialize NAN control interface %s",
+					ifname);
+				(void)wpa_supplicant_remove_iface(ctx->supplicant, wpa_s, 0);
+				goto free_msg;
+			}
+
+			ctx->iface = iface;
+			(void)net_if_get_name(iface, ctx->if_name,
+					      CONFIG_NET_INTERFACE_NAME_LEN);
+			first_iface = get_iface_count(ctx) == 1;
+			wpa_msg_register_cb(zephyr_hostap_ctrl_iface_msg_cb);
+			result = 0;
+		}
+
+free_msg:
+		os_free(msg->data);
+		os_free(msg);
+
+		(void)k_mutex_lock(&ctx->nan_lock, K_FOREVER);
+		if (ctx->nan_add_pending) {
+			ctx->nan_add_ret = result;
+			ctx->nan_add_first_iface = first_iface;
+			ctx->nan_add_pending = false;
+			k_sem_give(&ctx->nan_add_complete);
+		}
+		(void)k_mutex_unlock(&ctx->nan_lock);
+	} while (!k_fifo_is_empty(&ctx->nan_fifo));
+}
+
+static int register_nan_add_socket(struct supplicant_context *ctx)
+{
+	int ret;
+
+	k_mutex_init(&ctx->nan_lock);
+	k_fifo_init(&ctx->nan_fifo);
+	k_sem_init(&ctx->nan_add_complete, 0, 1);
+	ctx->nan_sock = -1;
+	ctx->nan_add_ret = -EIO;
+	ctx->nan_add_pending = false;
+	ctx->nan_add_first_iface = false;
+
+	ret = zvfs_eventfd(0, ZVFS_EFD_NONBLOCK);
+	if (ret < 0) {
+		return -errno;
+	}
+
+	ctx->nan_sock = ret;
+	eloop_register_read_sock(ctx->nan_sock, nan_add_handler, NULL, ctx);
+
+	return 0;
+}
+
+static void unregister_nan_add_socket(struct supplicant_context *ctx)
+{
+	struct zephyr_msg *msg;
+
+	(void)k_mutex_lock(&ctx->nan_lock, K_FOREVER);
+	if (ctx->nan_sock >= 0) {
+		eloop_unregister_read_sock(ctx->nan_sock);
+		close(ctx->nan_sock);
+		ctx->nan_sock = -1;
+	}
+	if (ctx->nan_add_pending) {
+		ctx->nan_add_ret = -ESHUTDOWN;
+		ctx->nan_add_pending = false;
+		k_sem_give(&ctx->nan_add_complete);
+	}
+
+	while ((msg = k_fifo_get(&ctx->nan_fifo, K_NO_WAIT)) != NULL) {
+		os_free(msg->data);
+		os_free(msg);
+	}
+	(void)k_mutex_unlock(&ctx->nan_lock);
+}
+
+static int zephyr_nan_add_iface(struct supplicant_context *ctx,
+					struct net_if *iface,
+					bool *first_iface)
+{
+	struct zephyr_msg *msg;
+	int ret;
+
+	if (iface == NULL) {
+		return -EINVAL;
+	}
+
+	(void)k_mutex_lock(&ctx->nan_lock, K_FOREVER);
+	if (ctx->nan_sock < 0) {
+		(void)k_mutex_unlock(&ctx->nan_lock);
+		return -ESHUTDOWN;
+	}
+	if (ctx->nan_add_pending) {
+		(void)k_mutex_unlock(&ctx->nan_lock);
+		return -EBUSY;
+	}
+
+	ctx->nan_add_pending = true;
+	ctx->nan_add_ret = -EIO;
+	ctx->nan_add_first_iface = false;
+
+	msg = os_zalloc(sizeof(*msg));
+	if (msg == NULL) {
+		ctx->nan_add_pending = false;
+		(void)k_mutex_unlock(&ctx->nan_lock);
+		return -ENOMEM;
+	}
+
+	msg->data = os_zalloc(sizeof(iface) + 1);
+	if (msg->data == NULL) {
+		os_free(msg);
+		ctx->nan_add_pending = false;
+		(void)k_mutex_unlock(&ctx->nan_lock);
+		return -ENOMEM;
+	}
+
+	memcpy(msg->data, &iface, sizeof(iface));
+	msg->len = sizeof(iface);
+
+	/*
+	 * Keep the lock across notify and enqueue so the handler cannot observe
+	 * the event before its FIFO item is available.
+	 */
+	ret = zvfs_eventfd_write(ctx->nan_sock, 1);
+	if (ret < 0) {
+		ret = -errno;
+		os_free(msg->data);
+		os_free(msg);
+		ctx->nan_add_pending = false;
+		(void)k_mutex_unlock(&ctx->nan_lock);
+		return ret;
+	}
+
+	k_fifo_put(&ctx->nan_fifo, msg);
+	(void)k_mutex_unlock(&ctx->nan_lock);
+
+	(void)k_sem_take(&ctx->nan_add_complete, K_FOREVER);
+	(void)k_mutex_lock(&ctx->nan_lock, K_FOREVER);
+	ret = ctx->nan_add_ret;
+	if (first_iface != NULL) {
+		*first_iface = ctx->nan_add_first_iface;
+	}
+	(void)k_mutex_unlock(&ctx->nan_lock);
+
+	return ret;
+}
+
+static int add_nan_interface(struct supplicant_context *ctx,
+				     struct net_if *iface)
+{
+	struct wifi_nm_instance *nm;
+	char ifname[IFNAMSIZ + 1] = { 0 };
+	bool first_iface = false;
+	int ret;
+
+	if (!ctx || !iface) {
+		return -EINVAL;
+	}
+
+	ret = net_if_get_name(iface, ifname, sizeof(ifname) - 1);
+	if (ret < 0) {
+		return ret;
+	}
+
+	nm = wifi_nm_get_instance("wifi_supplicant");
+	if (nm == NULL) {
+		return -ENOENT;
+	}
+
+	ret = wifi_nm_register_mgd_type_iface(nm, WIFI_TYPE_NAN, iface);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = zephyr_nan_add_iface(ctx, iface, &first_iface);
+	if (ret < 0) {
+		LOG_ERR("Failed to add NAN supplicant interface %s (%d)", ifname, ret);
+		(void)wifi_nm_unregister_mgd_iface(nm, iface);
+		return ret;
+	}
+
+	supplicant_generate_state_event(
+		ifname, NET_EVENT_SUPPLICANT_CMD_IFACE_ADDED, 0);
+	if (first_iface) {
+		supplicant_generate_state_event(ifname, NET_EVENT_SUPPLICANT_CMD_READY, 0);
+	}
+
+	return 0;
+}
+#endif /* CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN */
+>>>>>>> a23ce9a41b6 (net: wifi: decouple device lifecycle from net_if activation)
 
 static void iface_work_handler(struct k_work *work)
 {
@@ -675,7 +957,15 @@ static void interface_handler(struct net_mgmt_event_callback *cb,
 #endif
 	if (mgmt_event == NET_EVENT_IF_ADMIN_UP) {
 		LOG_INF("Network interface %d (%p) up", net_if_get_by_iface(iface), iface);
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
+		if (IS_BIT_SET(get_iface_caps(iface), WIFI_TYPE_NAN)) {
+			add_nan_interface(get_default_context(), iface);
+		} else {
+			add_interface(get_default_context(), iface);
+		}
+#else
 		add_interface(ctx, iface);
+#endif
 		return;
 	}
 	if (mgmt_event == NET_EVENT_IF_ADMIN_DOWN) {
@@ -709,7 +999,19 @@ static void iface_cb(struct net_if *iface, void *user_data)
 	}
 #endif
 
+	if (!net_if_is_admin_up(iface)) {
+		return;
+	}
+
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
+	if (IS_BIT_SET(get_iface_caps(iface), WIFI_TYPE_NAN)) {
+		ret = add_nan_interface(ctx, iface);
+	} else {
+		ret = add_interface(ctx, iface);
+	}
+#else
 	ret = add_interface(ctx, iface);
+#endif
 	if (ret < 0) {
 		return;
 	}
@@ -844,6 +1146,9 @@ static void handler(void)
 {
 	struct supplicant_context *ctx;
 	struct wpa_params params;
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
+	int ret;
+#endif
 	struct k_work_queue_config iface_wq_cfg = {
 		.name = "hostap_iface_wq",
 	};
@@ -891,6 +1196,14 @@ static void handler(void)
 #endif
 	zephyr_global_wpa_ctrl_init();
 
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
+	ret = register_nan_add_socket(ctx);
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize NAN interface queue (%d)", ret);
+		goto out;
+	}
+#endif
+
 	register_supplicant_event_socket(ctx);
 
 	submit_iface_work(ctx, NULL, setup_interface_monitoring);
@@ -901,6 +1214,10 @@ static void handler(void)
 	wpa_msg_register_ifname_cb(zephyr_hostap_msg_ifname_cb);
 
 	(void)wpa_supplicant_run(ctx->supplicant);
+
+#ifdef CONFIG_WIFI_NM_WPA_SUPPLICANT_NAN
+	unregister_nan_add_socket(ctx);
+#endif
 
 	supplicant_generate_state_event(ctx->if_name, NET_EVENT_SUPPLICANT_CMD_NOT_READY, 0);
 

@@ -425,6 +425,73 @@ static const struct wifi_mgmt_ops *const get_wifi_api(struct net_if *iface)
 	return off_api ? off_api->wifi_mgmt_api : NULL;
 }
 
+/*
+ * Device-lifecycle requests must bypass a network-manager instance. The
+ * supplied interface is only an anchor used to resolve the physical device;
+ * it does not need to be administratively up.
+ */
+static const struct wifi_mgmt_ops *const get_wifi_device_api(struct net_if *iface)
+{
+	const struct device *dev;
+	struct net_wifi_mgmt_offload *off_api;
+
+	if (iface == NULL || !net_if_is_wifi(iface)) {
+		return NULL;
+	}
+
+	dev = net_if_get_device(iface);
+	if (dev == NULL || dev->api == NULL) {
+		return NULL;
+	}
+
+	off_api = (struct net_wifi_mgmt_offload *)dev->api;
+	return off_api->wifi_mgmt_api;
+}
+
+static int wifi_on(uint64_t mgmt_request, struct net_if *iface,
+		   void *data, size_t len)
+{
+	const struct device *dev;
+	const struct wifi_mgmt_ops *const wifi_mgmt_api =
+		get_wifi_device_api(iface);
+
+	ARG_UNUSED(mgmt_request);
+	ARG_UNUSED(data);
+
+	if (len != 0U || wifi_mgmt_api == NULL ||
+	    wifi_mgmt_api->wifi_on == NULL) {
+		return wifi_mgmt_api == NULL || wifi_mgmt_api->wifi_on == NULL ?
+			-ENOTSUP : -EINVAL;
+	}
+
+	dev = net_if_get_device(iface);
+	return wifi_mgmt_api->wifi_on(dev);
+}
+
+NET_MGMT_REGISTER_REQUEST_HANDLER(NET_REQUEST_WIFI_ON, wifi_on);
+
+static int wifi_off(uint64_t mgmt_request, struct net_if *iface,
+		    void *data, size_t len)
+{
+	const struct device *dev;
+	const struct wifi_mgmt_ops *const wifi_mgmt_api =
+		get_wifi_device_api(iface);
+
+	ARG_UNUSED(mgmt_request);
+	ARG_UNUSED(data);
+
+	if (len != 0U || wifi_mgmt_api == NULL ||
+	    wifi_mgmt_api->wifi_off == NULL) {
+		return wifi_mgmt_api == NULL || wifi_mgmt_api->wifi_off == NULL ?
+			-ENOTSUP : -EINVAL;
+	}
+
+	dev = net_if_get_device(iface);
+	return wifi_mgmt_api->wifi_off(dev);
+}
+
+NET_MGMT_REGISTER_REQUEST_HANDLER(NET_REQUEST_WIFI_OFF, wifi_off);
+
 static int wifi_connect(uint64_t mgmt_request, struct net_if *iface,
 			void *data, size_t len)
 {
