@@ -22,6 +22,10 @@
 #include <drivers/driver_zephyr.h>
 #include <string.h>
 
+#ifdef CONFIG_WIFI_HWSIM_NAN
+#include <utils/eloop.h>
+#endif
+
 LOG_MODULE_DECLARE(wifi_hwsim, CONFIG_WIFI_HWSIM_LOG_LEVEL);
 
 #define SSID_IE_ID   0
@@ -48,6 +52,10 @@ struct hwsim_supp_ctx {
 	struct zep_wpa_supp_dev_callbk_fns callbk_fns;
 	struct k_work scan_done_work;
 	atomic_t scan_aborted;
+#ifdef CONFIG_WIFI_HWSIM_NAN
+	bool nan_started;
+	uint8_t nan_cluster_id[HWSIM_ETH_ALEN];
+#endif
 };
 
 static struct hwsim_radio *hwsim_dev_to_radio(const struct device *dev)
@@ -921,3 +929,126 @@ const struct zep_wpa_supp_dev_ops hwsim_wpa_supp_ops = {
 	.cancel_remain_on_channel = hwsim_supp_cancel_remain_on_channel,
 	.set_p2p_powersave = hwsim_supp_set_p2p_powersave,
 };
+
+#ifdef CONFIG_WIFI_HWSIM_NAN
+/* NAN operations and timers run on the supplicant eloop thread. */
+static void hwsim_nan_cluster_join(void *eloop_ctx, void *timeout_ctx)
+{
+	struct hwsim_supp_ctx *ctx = eloop_ctx;
+
+	ARG_UNUSED(timeout_ctx);
+
+	if (ctx->nan_started) {
+		/* The callback owns the queued event's copy of the cluster ID. */
+		ctx->callbk_fns.nan_cluster_join(ctx->if_ctx, ctx->nan_cluster_id, true);
+	}
+}
+
+static void *hwsim_nan_init(void *supp_drv_if_ctx, const char *iface_name,
+			    struct zep_wpa_supp_dev_callbk_fns *callbk_fns)
+{
+	struct hwsim_radio *radio;
+	struct hwsim_supp_ctx *ctx;
+
+	if (callbk_fns->nan_cluster_join == NULL) {
+		return NULL;
+	}
+
+	radio = hwsim_supp_init(supp_drv_if_ctx, iface_name, callbk_fns);
+	if (radio == NULL) {
+		return NULL;
+	}
+
+	ctx = radio->supp_ctx;
+	ctx->nan_started = false;
+	memset(ctx->nan_cluster_id, 0, sizeof(ctx->nan_cluster_id));
+	return radio;
+}
+
+static int hwsim_nan_start(void *if_priv, const struct nan_cluster_config *conf)
+{
+	static const uint8_t cluster_prefix[] = {0x50, 0x6f, 0x9a, 0x01};
+	struct hwsim_radio *radio = if_priv;
+	struct hwsim_supp_ctx *ctx = radio->supp_ctx;
+	int ret;
+
+	if (ctx == NULL || conf == NULL || conf->master_pref == 0U ||
+	    conf->master_pref == UINT8_MAX) {
+		return -EINVAL;
+	}
+	if (conf->dual_band != 0U || conf->enable_dw_notif || conf->extra_nan_attrs_len != 0U ||
+	    conf->vendor_elems_len != 0U) {
+		return -ENOTSUP;
+	}
+	if (ctx->nan_started) {
+		return -EALREADY;
+	}
+
+	if (is_zero_ether_addr(conf->cluster_id)) {
+		memcpy(ctx->nan_cluster_id, cluster_prefix, sizeof(cluster_prefix));
+		ctx->nan_cluster_id[4] = 0U;
+		ctx->nan_cluster_id[5] = radio->idx + 1U;
+	} else {
+		if (memcmp(conf->cluster_id, cluster_prefix, sizeof(cluster_prefix)) != 0) {
+			return -EINVAL;
+		}
+		memcpy(ctx->nan_cluster_id, conf->cluster_id, sizeof(ctx->nan_cluster_id));
+	}
+
+	/* Model a new cluster; no beacon exchange or master election is performed. */
+	ret = eloop_register_timeout(CONFIG_WIFI_HWSIM_NAN_CLUSTER_EVENT_DELAY_MS / 1000,
+				     (CONFIG_WIFI_HWSIM_NAN_CLUSTER_EVENT_DELAY_MS % 1000) * 1000,
+				     hwsim_nan_cluster_join, ctx, NULL);
+	if (ret != 0) {
+		return -ENOMEM;
+	}
+	ctx->nan_started = true;
+	return 0;
+}
+
+static void hwsim_nan_stop(void *if_priv)
+{
+	struct hwsim_radio *radio = if_priv;
+	struct hwsim_supp_ctx *ctx = radio->supp_ctx;
+
+	if (ctx != NULL) {
+		ctx->nan_started = false;
+		(void)eloop_cancel_timeout(hwsim_nan_cluster_join, ctx, NULL);
+	}
+}
+
+static void hwsim_nan_deinit(void *if_priv)
+{
+	hwsim_nan_stop(if_priv);
+	hwsim_supp_deinit(if_priv);
+}
+
+static int hwsim_nan_get_capa(void *if_priv, struct wpa_driver_capa *capa)
+{
+	ARG_UNUSED(if_priv);
+
+	memset(capa, 0, sizeof(*capa));
+	capa->flags2 = WPA_DRIVER_FLAGS2_SUPPORT_NAN;
+	capa->nan_capa.drv_flags = WPA_DRIVER_FLAGS_NAN_SUPPORT_SYNC_CONFIG;
+	capa->nan_capa.num_radios = 1U;
+	capa->nan_capa.num_antennas = 1U;
+	return 0;
+}
+
+/* Keep station/AP operations and capabilities in their original table. */
+const struct zep_wpa_supp_dev_ops hwsim_nan_wpa_supp_ops = {
+	.init = hwsim_nan_init,
+	.deinit = hwsim_nan_deinit,
+	/* Common supplicant initialization clears keys and closes the port. */
+	.set_key = hwsim_supp_set_key,
+	.set_supp_port = hwsim_supp_set_supp_port,
+	.get_capa = hwsim_nan_get_capa,
+	.get_wiphy = hwsim_supp_get_wiphy,
+	.get_country = hwsim_supp_get_country,
+	.set_country = hwsim_supp_set_country,
+	.register_frame = hwsim_supp_register_frame,
+	.register_mgmt_frame = hwsim_supp_register_mgmt_frame,
+	.nan_start = hwsim_nan_start,
+	.nan_stop = hwsim_nan_stop,
+};
+#endif /* CONFIG_WIFI_HWSIM_NAN */
